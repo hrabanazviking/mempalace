@@ -36,14 +36,41 @@ from mempalace.knowledge_graph import KnowledgeGraph  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _reset_mcp_cache():
-    """Reset the MCP server's cached ChromaDB client/collection between tests."""
+    """Reset cached MCP state between tests without importing mcp_server.
+
+    If mempalace.mcp_server is already imported, close/clear its KG cache and
+    Chroma client cache. If it has not been imported, leave it unloaded so
+    fork/spawn-based tests do not inherit extra Chroma/SQLite state.
+    """
 
     def _clear_cache():
         try:
-            from mempalace import mcp_server
+            import sys
 
-            mcp_server._client_cache = None
-            mcp_server._collection_cache = None
+            mcp_server = sys.modules.get("mempalace.mcp_server")
+            if mcp_server is not None:
+                for kg in list(getattr(mcp_server, "_kg_by_path", {}).values()):
+                    close = getattr(kg, "close", None)
+                    if close is not None:
+                        try:
+                            close()
+                        except Exception:
+                            pass
+
+                if hasattr(mcp_server, "_kg_by_path"):
+                    mcp_server._kg_by_path.clear()
+
+                mcp_server._client_cache = None
+                mcp_server._collection_cache = None
+        except AttributeError:
+            pass
+
+        try:
+            # Reset the per-process quarantine gate so tests don't leak
+            # state through ChromaBackend._quarantined_paths.
+            from mempalace.backends.chroma import ChromaBackend
+
+            ChromaBackend._quarantined_paths.clear()
         except (ImportError, AttributeError):
             pass
 
@@ -101,7 +128,7 @@ def config(tmp_dir, palace_path):
 def collection(palace_path):
     """A ChromaDB collection pre-seeded in the temp palace."""
     client = chromadb.PersistentClient(path=palace_path)
-    col = client.get_or_create_collection("mempalace_drawers")
+    col = client.get_or_create_collection("mempalace_drawers", metadata={"hnsw:space": "cosine"})
     yield col
     client.delete_collection("mempalace_drawers")
     del client
@@ -169,7 +196,9 @@ def seeded_collection(collection):
 def kg(tmp_dir):
     """An isolated KnowledgeGraph using a temp SQLite file."""
     db_path = os.path.join(tmp_dir, "test_kg.sqlite3")
-    return KnowledgeGraph(db_path=db_path)
+    graph = KnowledgeGraph(db_path=db_path)
+    yield graph
+    graph.close()
 
 
 @pytest.fixture

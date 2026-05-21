@@ -11,7 +11,7 @@ A Claude Code plugin that gives your AI a persistent memory system. Mine project
 ### Claude Code Marketplace
 
 ```bash
-claude plugin marketplace add milla-jovovich/mempalace
+claude plugin marketplace add MemPalace/mempalace
 claude plugin install --scope user mempalace
 ```
 
@@ -23,7 +23,7 @@ claude plugin add /path/to/mempalace
 
 ## Post-Install Setup
 
-After installing the plugin, run the init command to complete setup (pip install, MCP configuration, etc.):
+After installing the plugin, run the init command to complete setup (installs the `mempalace` package via `uv tool` or `pip`, configures MCP, etc.):
 
 ```
 /mempalace:init
