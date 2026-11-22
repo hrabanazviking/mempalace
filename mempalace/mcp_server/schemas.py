@@ -248,13 +248,24 @@ TOOLS = {
         "handler": tool_delete_tunnel,
     },
     "mempalace_list_hallways": {
-        "description": "List within-wing hallway records (entity-to-entity co-occurrence links built at mine time). Optionally filter by wing.",
+        "description": "List within-wing hallway records (entity-to-entity co-occurrence links built at mine time), strongest first, paged. Optionally filter by wing. Returns {hallways, total, count, offset, limit}.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "wing": {
                     "type": "string",
                     "description": "Filter hallways by wing",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Page size (default 100, max 500)",
+                    "minimum": 1,
+                    "maximum": 500,
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Offset for pagination (default 0)",
+                    "minimum": 0,
                 },
             },
         },
@@ -284,7 +295,11 @@ TOOLS = {
         "handler": tool_follow_tunnels,
     },
     "mempalace_search": {
-        "description": "Semantic search. Returns verbatim drawer content with similarity scores. IMPORTANT: 'query' must contain ONLY search keywords. Use 'context' for background. Results with cosine distance > max_distance are filtered out.",
+        "description": (
+            "Search past-session memories. Returns matching drawers. "
+            "Not for the current conversation — if it happened in this "
+            "session, answer from context instead."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
@@ -315,7 +330,8 @@ TOOLS = {
                     "description": (
                         "Only drawers filed on/after this ISO date or datetime "
                         "(inclusive), e.g. '2026-04-01' or '2026-04-01T09:30:00'. "
-                        "Compares the drawer's created_at (filed_at) wall-clock; "
+                        "A value without an offset is local time. Compares the "
+                        "drawer's created_at (filed_at) as an instant; "
                         "drawers without a filed_at are excluded while set."
                     ),
                 },
@@ -328,16 +344,31 @@ TOOLS = {
                 },
                 "max_distance": {
                     "type": "number",
-                    "description": "Max cosine distance threshold (0=identical, 2=opposite). Results further than this are dropped. Lower = stricter. Default 1.5. Set to 0 to disable.",
+                    "description": "Optional distance cutoff on the cosine scale (0=identical, 2=opposite), applied the same way whatever metric the palace uses. Results further than this are dropped and counted in filtered_by_max_distance. Lower = stricter. Default: no cutoff.",
                 },
                 "candidate_strategy": {
                     "type": "string",
-                    "enum": ["vector", "union"],
-                    "description": "Candidate source strategy. 'vector' preserves default semantic search; 'union' also merges backend BM25 lexical candidates before reranking.",
+                    "enum": ["vector", "union", "lexical"],
+                    "description": (
+                        "Candidate source strategy. 'vector' preserves default semantic search; "
+                        "'union' also merges backend BM25 lexical candidates before reranking; "
+                        "'lexical' runs FTS5/BM25 lexical search only without loading embeddings."
+                    ),
                 },
                 "cli_compatible": {
                     "type": "boolean",
                     "description": "Preserve standalone CLI candidate selection, ranking, and output. Used by the CLI Hub forwarder.",
+                },
+                "include_media": {
+                    "type": "boolean",
+                    "x-mempalace-strict": True,
+                    "description": "Opt in to local image/audio/video assets and text in the shared EmbeddingGemma 2 space. Returns media paths and metadata with cosine ranking.",
+                },
+                "query_task": {
+                    "type": "string",
+                    "x-mempalace-strict": True,
+                    "enum": ["search", "code"],
+                    "description": "EmbeddingGemma 2 task prompt: general search (default) or native code retrieval.",
                 },
                 "context": {
                     "type": "string",
@@ -435,7 +466,7 @@ TOOLS = {
         "handler": tool_checkpoint,
     },
     "mempalace_delete_drawer": {
-        "description": "Delete a drawer by ID. Irreversible.",
+        "description": "Delete a drawer by ID. Irreversible. Its earlier revisions in drawer_revisions.jsonl are removed too, except text a re-mine journaled for that position, which stays until its source is deleted with mempalace_delete_by_source.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -444,6 +475,34 @@ TOOLS = {
             "required": ["drawer_id"],
         },
         "handler": tool_delete_drawer,
+    },
+    "mempalace_delete_drawers": {
+        "description": (
+            "Delete many drawers by ID in one call — the bulk form of "
+            "mempalace_delete_drawer. Each ID is removed the same way as the "
+            "singular tool: a logical drawer id removes the whole group, "
+            "including its chunk rows, and a physical chunk id removes that "
+            "one row. Irreversible. A missing ID is an item in `results` and "
+            "is counted in `errors`; the rest of the batch still runs. An "
+            "accepted call (1 to 500 IDs) always returns `results` plus "
+            "`deleted`/`errors` totals, including a one-ID call. An empty "
+            "list, a non-list, or more than 500 IDs is rejected with `error` "
+            "and deletes nothing. Each deleted drawer's earlier revisions are "
+            "removed too, except re-mine history, which goes with its source "
+            "(mempalace_delete_by_source)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "drawer_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "One or more drawer IDs to delete (max 500)",
+                },
+            },
+            "required": ["drawer_ids"],
+        },
+        "handler": tool_delete_drawers,
     },
     "mempalace_mine": {
         "description": (
@@ -495,13 +554,31 @@ TOOLS = {
                         "Ignored by other modes."
                     ),
                 },
+                "include_ignored": {
+                    "type": "array",
+                    "x-mempalace-strict": True,
+                    "items": {"type": "string"},
+                    "description": (
+                        "Project-relative paths to scan even if ignored, matching CLI "
+                        "--include-ignored. Projects mode only; default: []."
+                    ),
+                },
+                "include_subagents": {
+                    "type": "boolean",
+                    "x-mempalace-strict": True,
+                    "description": (
+                        "Also mine Claude Code subagent transcripts (subagents/ dirs), "
+                        "matching CLI --include-subagents. Convos mode only; ignored by "
+                        "other modes. Default: false."
+                    ),
+                },
             },
             "required": ["source"],
         },
         "handler": tool_mine,
     },
     "mempalace_delete_by_source": {
-        "description": "Bulk-delete every drawer mined from one source_file (exact match). Use to clean up benchmark/test data accidentally mined into a user wing (#1722). Returns a dry-run match count and sample by default; pass dry_run=false to commit. Irreversible.",
+        "description": "Bulk-delete every drawer mined from one source_file (exact match). Use to clean up benchmark/test data accidentally mined into a user wing. Returns a dry-run match count and sample by default; pass dry_run=false to commit. Irreversible; a commit also removes those drawers' earlier revisions.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -542,10 +619,44 @@ TOOLS = {
             "type": "object",
             "properties": {
                 "drawer_id": {"type": "string", "description": "ID of the drawer to fetch"},
+                "include_source_bytes": {
+                    "type": "boolean",
+                    "description": (
+                        "Also return `source_bytes_base64`: the drawer's exact source bytes, "
+                        "for a drawer whose metadata names a `source_encoding`. Responses "
+                        "show a byte that is not valid UTF-8 as U+FFFD; these bytes keep it."
+                    ),
+                },
             },
             "required": ["drawer_id"],
         },
         "handler": tool_get_drawer,
+    },
+    "mempalace_get_drawers": {
+        "description": (
+            "Fetch many drawers by ID in one call — the bulk form of "
+            "mempalace_get_drawer for a caller that already holds a list of IDs. "
+            "Each ID resolves the same way as the singular tool (a logical id "
+            "reassembles the chunk group; a physical chunk id returns that row) "
+            "and returns the same per-drawer payload. An ID that does not "
+            "resolve is an item in `results` and is counted in `errors`; the "
+            "rest of the batch still returns. An accepted call (1 to 500 IDs) "
+            "always returns `results`, including a one-ID call. An empty list, "
+            "a non-list, or more than 500 IDs is rejected with `error` and "
+            "does not read the palace."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "drawer_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "One or more drawer IDs to fetch (max 500)",
+                },
+            },
+            "required": ["drawer_ids"],
+        },
+        "handler": tool_get_drawers,
     },
     "mempalace_list_drawers": {
         "description": "List drawers with pagination. Optional wing/room filter and since/before date filter on filed_at (since inclusive, before exclusive; drawers without a parseable filed_at are excluded when a date bound is set). Returns IDs, wings, rooms, content previews, and total matching count for pagination.",
@@ -573,12 +684,21 @@ TOOLS = {
                     "description": "Offset for pagination (default 0)",
                     "minimum": 0,
                 },
+                "sort": {
+                    "type": "string",
+                    "enum": ["storage", "recent"],
+                    "description": "Ordering: 'storage' (default) or 'recent' (newest filed_at first).",
+                },
+                "include_content": {
+                    "type": "boolean",
+                    "description": "Include full verbatim drawer content for each item on the returned page (default false).",
+                },
             },
         },
         "handler": tool_list_drawers,
     },
     "mempalace_update_drawer": {
-        "description": "Update an existing drawer's content and/or metadata (wing, room). Fetches existing drawer first; returns error if not found.",
+        "description": "Update an existing drawer's content and/or metadata (wing, room). Fetches existing drawer first; returns error if not found. The replaced text is kept verbatim in the palace's drawer_revisions.jsonl until the drawer or its source is deleted.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -807,8 +927,9 @@ TOOLS = {
             " peer's event syncs in whenever it arrives, so it can already be older than a"
             " timestamp cursor and be missed permanently; since_created_at is a time window"
             " ('what happened today'), not a cursor. Pass preview=true when sweeping a busy"
-            " stream. to_agent=<you> also matches '*' broadcasts. To wait for future events, use"
-            " mempalace_event_wait."
+            " stream. to_agent=<you> also matches '*' broadcasts. writer=<agent> filters by who"
+            " wrote an event; from_agent is your identity and never filters. To wait for"
+            " future events, use mempalace_event_wait."
         ),
         "input_schema": {
             "type": "object",
@@ -821,7 +942,17 @@ TOOLS = {
                     "type": "string",
                     "description": "Filter by target agent; also matches '*' broadcasts (optional)",
                 },
-                "from_agent": {"type": "string", "description": "Filter by writer (optional)"},
+                "from_agent": {
+                    "type": "string",
+                    "description": (
+                        "Your agent identity (optional). NOT a filter: it never narrows the result."
+                        " To filter by who wrote an event use writer."
+                    ),
+                },
+                "writer": {
+                    "type": "string",
+                    "description": "Filter by the agent that wrote the event (optional)",
+                },
                 "correlation_id": {
                     "type": "string",
                     "description": "Filter by correlation id (optional)",
@@ -885,7 +1016,17 @@ TOOLS = {
                     "type": "string",
                     "description": "Filter by target agent; also matches '*' broadcasts (optional)",
                 },
-                "from_agent": {"type": "string", "description": "Filter by writer (optional)"},
+                "from_agent": {
+                    "type": "string",
+                    "description": (
+                        "Your agent identity (optional). NOT a filter: it never narrows the result."
+                        " To filter by who wrote an event use writer."
+                    ),
+                },
+                "writer": {
+                    "type": "string",
+                    "description": "Filter by the agent that wrote the event (optional)",
+                },
                 "correlation_id": {
                     "type": "string",
                     "description": "Filter by correlation id (optional)",
@@ -1011,6 +1152,16 @@ TOOLS = {
         "handler": tool_patch_submit,
     },
 }
+
+
+# Read/write class and gate flags live in mempalace.tool_capabilities, which the
+# daemon and CLI import without this package. Every tool needs a row there.
+if set(TOOLS) != set(_tool_capabilities.TOOL_CAPABILITIES):
+    raise RuntimeError(
+        "mempalace.tool_capabilities does not match TOOLS: "
+        f"missing={sorted(set(TOOLS) - set(_tool_capabilities.TOOL_CAPABILITIES))} "
+        f"extra={sorted(set(_tool_capabilities.TOOL_CAPABILITIES) - set(TOOLS))}"
+    )
 
 
 SUPPORTED_PROTOCOL_VERSIONS = [

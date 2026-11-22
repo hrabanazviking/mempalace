@@ -22,7 +22,7 @@ def _reconfigure_stdio_utf8_on_windows():
 def main():
     """CLI entry point for the ``mempalace`` console script.
 
-    Side effect: pops ``PYTHONPATH`` from ``os.environ`` (see #1423) so
+    Side effect: pops ``PYTHONPATH`` from ``os.environ`` so
     any subprocess this CLI spawns inherits a clean env. Host applications
     that call ``main()`` programmatically should be aware that the parent
     process loses ``PYTHONPATH`` as well. Library imports
@@ -67,6 +67,12 @@ def main():
     p_init = sub.add_parser("init", help="Detect rooms from your folder structure")
     p_init.add_argument("dir", help="Project directory to set up")
     p_init.add_argument(
+        "--palace",
+        default=argparse.SUPPRESS,
+        help="Where the palace lives (default: from ~/.mempalace/config.json or ~/.mempalace/palace); "
+        "may be passed before or after the subcommand",
+    )
+    p_init.add_argument(
         "--backend",
         default=None,
         help="Storage backend to persist for this palace (default: chroma)",
@@ -92,6 +98,16 @@ def main():
             "(e.g. 'en' or 'en,pt-br'). Defaults to value from config "
             "(MEMPALACE_ENTITY_LANGUAGES env var or config.json), or 'en'. "
             "When given, the value is also persisted to config.json."
+        ),
+    )
+    p_init.add_argument(
+        "--embedding-model",
+        default=None,
+        choices=["embeddinggemma", "embeddinggemma2", "minilm", "openai-compat"],
+        help=(
+            "Embedding model to record in config.json for this palace. "
+            "embeddinggemma is multilingual (~300 MB download); minilm is "
+            "English-only (~30 MB). Left unset, the configured or default model applies."
         ),
     )
     p_init.add_argument(
@@ -144,7 +160,7 @@ def main():
         action="store_true",
         help=(
             "Bypass the interactive consent prompt that fires when an external "
-            "LLM is configured via an environment-variable API key (issue #26). "
+            "LLM is configured via an environment-variable API key. "
             "Use this in CI / non-interactive runs where you've already decided "
             "the external send is acceptable."
         ),
@@ -186,6 +202,11 @@ def main():
         ),
     )
     p_mine.add_argument("--wing", default=None, help="Wing name (default: directory name)")
+    p_mine.add_argument(
+        "--related-drawer-id",
+        default=None,
+        help="Associate media assets with an existing drawer (--source media only)",
+    )
     p_mine.add_argument(
         "--no-gitignore",
         action="store_true",
@@ -234,7 +255,7 @@ def main():
             f"Per-file chunk cap; files producing more chunks are skipped with a "
             f"summary counter. Default {_CLI_MAX_CHUNKS_PER_FILE_DEFAULT} "
             f"(or MEMPALACE_MAX_CHUNKS_PER_FILE). Set 0 to disable. Lower this on "
-            f"Windows if you hit ONNX bad_alloc (#1455)."
+            f"Windows if you hit ONNX bad_alloc."
         ),
     )
     p_mine.add_argument(
@@ -264,7 +285,7 @@ def main():
     add_cli_write_routing_flags(p_sweep)
     p_sync = sub.add_parser(
         "sync",
-        help="Prune drawers whose source files are gitignored, deleted, or moved (#1252)",
+        help="Prune drawers whose source files are gitignored, deleted, or moved",
     )
     p_sync.add_argument(
         "dir",
@@ -305,6 +326,17 @@ def main():
     p_search.add_argument("--wing", default=None, help="Limit to one project")
     p_search.add_argument("--room", default=None, help="Limit to one room")
     p_search.add_argument("--results", type=int, default=5, help="Number of results")
+    p_search.add_argument(
+        "--include-media",
+        action="store_true",
+        help="Include local media assets using shared EmbeddingGemma 2 cosine ranking",
+    )
+    p_search.add_argument(
+        "--query-task",
+        choices=["search", "code"],
+        default="search",
+        help="Use the EmbeddingGemma 2 code retrieval prompt (default: search)",
+    )
     p_search.add_argument(
         "--since",
         default=None,
@@ -385,7 +417,7 @@ def main():
         help="Output skill instructions to stdout",
     )
     instructions_sub = p_instructions.add_subparsers(dest="instructions_name")
-    for instr_name in ["init", "search", "mine", "help", "status"]:
+    for instr_name in ["init", "search", "mine", "help", "status", "audit"]:
         instructions_sub.add_parser(instr_name, help=f"Output {instr_name} instructions")
 
     # rules
@@ -419,7 +451,7 @@ def main():
         choices=["full", "light"],
         default="full",
         help=(
-            "Tool names in the block: 'full' (default, the 45-tool mempalace-mcp) or "
+            "Tool names in the block: 'full' (default, the 47-tool mempalace-mcp) or "
             "'light' (palace_query / palace_exec / palace_coordinate)"
         ),
     )
@@ -448,7 +480,7 @@ def main():
         "--confirm-truncation-ok",
         action="store_true",
         help=(
-            "Override the #1208 safety guard. Required when chromadb's collection-layer "
+            "Override the 10,000-drawer safety guard. Required when chromadb's collection-layer "
             "extraction returns exactly 10,000 drawers and the SQLite ground-truth check "
             "either matches or can't be read. Use only after independently confirming "
             "the palace really contains that count."
@@ -508,7 +540,7 @@ def main():
         help="Print what the repair would do and exit without modifying the palace",
     )
 
-    # repair-status — read-only HNSW capacity health check (#1222)
+    # repair-status — read-only HNSW capacity health check
     sub.add_parser(
         "repair-status",
         help="Compare sqlite vs HNSW element counts (read-only; never opens a chromadb client)",
@@ -546,7 +578,7 @@ def main():
         help="Storage backend to include in the MCP startup command",
     )
 
-    # serve — turnkey remote HTTP MCP server (#1877)
+    # serve — turnkey remote HTTP MCP server
     p_serve = sub.add_parser(
         "serve",
         help="Run a secure remote HTTP MCP server for a team to share one palace",
@@ -558,12 +590,22 @@ def main():
     p_serve.add_argument(
         "--backend", default=None, help="Storage backend (default: config/env/detected)"
     )
-    p_serve.add_argument("--palace", default=None, help="Palace path (overrides config/env)")
+    p_serve.add_argument(
+        "--palace",
+        default=argparse.SUPPRESS,
+        help="Palace path (overrides config/env); may be passed before or after the subcommand",
+    )
     p_serve.add_argument(
         "--token",
         default=None,
-        help="Bearer token clients must present. Default: reuse/auto-generate one for "
-        "non-loopback binds (stored 0600 under ~/.mempalace/server/).",
+        help="Bearer token clients must present. A loopback bind needs none unless this is "
+        "given; a network bind reuses/auto-generates one (stored 0600 under "
+        "~/.mempalace/server/; local clients read it from there).",
+    )
+    p_serve.add_argument(
+        "--no-token",
+        action="store_true",
+        help="Accepted for compatibility: a loopback bind already serves without a token",
     )
     p_serve.add_argument("--tls-cert", default=None, help="PEM certificate to enable TLS")
     p_serve.add_argument("--tls-key", default=None, help="PEM private key matching --tls-cert")
@@ -596,7 +638,7 @@ def main():
     # migrate-wings
     p_migrate_wings = sub.add_parser(
         "migrate-wings",
-        help="Normalize legacy wing names (strip leading/trailing separators) so pre-#1675 palaces stay discoverable",
+        help="Normalize legacy wing names (strip leading/trailing separators) so palaces filed under older wing names stay discoverable",
     )
     p_migrate_wings.add_argument(
         "--dry-run",
@@ -608,12 +650,164 @@ def main():
     p_hallways = sub.add_parser("hallways", help="List entity hallways (associative graph)")
     p_hallways.add_argument("--wing", default=None, help="Filter to one wing")
     p_hallways.add_argument("--limit", type=int, default=50, help="Max hallways to show")
+    p_hallways.add_argument(
+        "--prune-spellings",
+        action="store_true",
+        help="Remove hallways older mines wrote per entity spelling: self-links "
+        "(main.zig / src/main.zig) and duplicate spellings of one association; "
+        "dry run unless --yes",
+    )
+    p_hallways.add_argument("--yes", action="store_true", help="Apply --prune-spellings")
+    p_hallways.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Recompute hallways from drawer entities for --wing (or every wing); use after "
+        "`wings split`, which drops the split wing's records",
+    )
+    p_audit = sub.add_parser(
+        "audit",
+        help="Score how well organized the palace is (rooms, naming, tunnels, hallways, KG)",
+    )
+    p_audit.add_argument("--json", action="store_true", help="Emit the full report as JSON")
+    p_audit.add_argument(
+        "--quiet", action="store_true", help="Suppress the per-step progress lines on stderr"
+    )
+    p_audit.add_argument(
+        "--fail-under",
+        type=int,
+        default=None,
+        metavar="SCORE",
+        help="Exit 2 when the overall score is below SCORE (for CI or cron checks)",
+    )
+    p_rooms = sub.add_parser(
+        "rooms", help="Propose a closed room set for a wing with an LLM, then assign drawers to it"
+    )
+    rooms_sub = p_rooms.add_subparsers(dest="rooms_action")
+    p_rooms_propose = rooms_sub.add_parser(
+        "propose", help="Sample a wing and ask the LLM for a closed room set (saved for review)"
+    )
+    p_rooms_propose.add_argument("--wing", required=True, help="Wing to design rooms for")
+    p_rooms_propose.add_argument(
+        "--sample", type=int, default=60, help="Drawers to sample (default 60)"
+    )
+    p_rooms_propose.add_argument("--seed", type=int, default=0, help="Sampling seed (default 0)")
+    p_rooms_propose.add_argument(
+        "--max-rooms", type=int, default=12, help="Upper bound on proposed rooms (default 12)"
+    )
+    p_rooms_propose.add_argument(
+        "--llm-provider", default="ollama", choices=["ollama", "openai-compat", "anthropic"]
+    )
+    p_rooms_propose.add_argument("--llm-model", default="gemma4:e4b")
+    p_rooms_propose.add_argument("--llm-endpoint", default=None)
+    p_rooms_propose.add_argument("--llm-api-key", default=None)
+    p_rooms_propose.add_argument(
+        "--llm-timeout",
+        type=int,
+        default=600,
+        help="Seconds to wait for the LLM; a local model labelling 60 excerpts can take minutes "
+        "(default 600)",
+    )
+    p_rooms_propose.add_argument(
+        "--accept-external-llm",
+        action="store_true",
+        help="Allow the sampled excerpts to be sent to a non-local LLM endpoint",
+    )
+    p_rooms_apply = rooms_sub.add_parser(
+        "apply", help="Assign every drawer in the wing to its nearest room (dry run unless --yes)"
+    )
+    p_rooms_apply.add_argument("--wing", required=True, help="Wing whose room set to apply")
+    p_rooms_apply.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help="Minimum cosine similarity to move a drawer; below it the drawer keeps its room "
+        "(default 0.30)",
+    )
+    p_rooms_apply.add_argument(
+        "--from",
+        dest="from_rooms",
+        default=None,
+        metavar="ROOMS",
+        help="Comma-separated rooms whose drawers may move (default: the miner's generic rooms "
+        "general,technical,architecture,planning,problems); 'all' reclassifies every drawer",
+    )
+    p_rooms_apply.add_argument(
+        "--show",
+        type=int,
+        default=0,
+        metavar="N",
+        help="On a dry run, print N example drawers per destination room",
+    )
+    p_rooms_apply.add_argument("--yes", action="store_true", help="Write the room changes")
+    p_wings = sub.add_parser(
+        "wings", help="Wing maintenance: split a transcript wing by source project"
+    )
+    wings_sub = p_wings.add_subparsers(dest="wings_action")
+    p_wings_split = wings_sub.add_parser(
+        "split",
+        help="Re-key a machine-level transcript wing into one wing per source project "
+        "(plan file first; --yes applies)",
+    )
+    p_wings_split.add_argument("--wing", required=True, help="Wing to split")
+    p_wings_split.add_argument(
+        "--yes", action="store_true", help="Apply the saved plan (<palace>/wings/split-<wing>.json)"
+    )
+    p_kg = sub.add_parser("kg", help="Knowledge graph maintenance")
+    kg_sub = p_kg.add_subparsers(dest="kg_action")
+    p_kg_norm = kg_sub.add_parser(
+        "normalize",
+        help="Map one-off predicates onto a closed vocabulary with the LLM (plan first; "
+        "--yes applies, keeping history)",
+    )
+    p_kg_norm.add_argument(
+        "--vocabulary",
+        default=None,
+        help="Comma-separated allowed predicates (default: works_on,owns,depends_on,uses,"
+        "decided,status,located_in,measured)",
+    )
+    p_kg_norm.add_argument("--yes", action="store_true", help="Apply <palace>/kg/normalize.json")
+    p_kg_norm.add_argument(
+        "--llm-provider", default="ollama", choices=["ollama", "openai-compat", "anthropic"]
+    )
+    p_kg_norm.add_argument("--llm-model", default="gemma4:e4b")
+    p_kg_norm.add_argument("--llm-endpoint", default=None)
+    p_kg_norm.add_argument("--llm-api-key", default=None)
+    p_kg_norm.add_argument("--llm-timeout", type=int, default=600)
+    p_kg_norm.add_argument("--accept-external-llm", action="store_true")
+    p_kg_import = kg_sub.add_parser(
+        "import-legacy",
+        help="Copy facts from another knowledge graph file into this palace's graph "
+        "(dry run first; --yes applies; rows already here are kept)",
+    )
+    p_kg_import.add_argument(
+        "--from",
+        dest="source",
+        default=None,
+        help="Graph file to copy from (default: ~/.mempalace/knowledge_graph.sqlite3)",
+    )
+    p_kg_import.add_argument("--yes", action="store_true", help="Write the copied rows")
+    p_tunnels = sub.add_parser("tunnels", help="Propose or prune cross-wing tunnels")
+    tunnels_sub = p_tunnels.add_subparsers(dest="tunnels_action")
+    p_tunnels_propose = tunnels_sub.add_parser(
+        "propose",
+        help="Rank shared entities across wings into a reviewable tunnel plan (--yes creates them)",
+    )
+    p_tunnels_propose.add_argument("--max", type=int, default=60, help="Cap on proposed tunnels")
+    p_tunnels_propose.add_argument("--yes", action="store_true", help="Create the saved plan")
+    p_tunnels_prune = tunnels_sub.add_parser(
+        "prune",
+        help="Remove tunnels on generic tokens, missing wings or duplicate spellings (dry run "
+        "unless --yes)",
+    )
+    p_tunnels_prune.add_argument("--yes", action="store_true", help="Apply the prune")
     p_status = sub.add_parser("status", help="Show what's been filed")
     p_status.add_argument(
         "--backend",
         default=None,
         help="Storage backend to use for status (default: config/env/detected/chroma)",
     )
+    p_export = sub.add_parser("export", help="Export the palace as a folder of markdown files")
+    p_export.add_argument("output_dir", help="Directory to write the markdown tree into")
     p_update = sub.add_parser("update", help="Opt-in release checks and upgrade planning")
     update_sub = p_update.add_subparsers(dest="update_action")
     p_update_configure = update_sub.add_parser("configure", help="Configure periodic checks")
@@ -1006,7 +1200,34 @@ def main():
         "migrate": cmd_migrate,
         "migrate-wings": cmd_migrate_wings,
         "hallways": cmd_hallways,
+        "audit": cmd_audit,
+        "rooms": cmd_rooms,
+        "wings": cmd_wings,
+        "kg": cmd_kg,
+        "tunnels": cmd_tunnels,
+        "export": cmd_export,
         "status": cmd_status,
         "update": cmd_update,
     }
-    dispatch[args.command](args)
+    exit_code = 0
+    try:
+        dispatch[args.command](args)
+    except SystemExit as exc:
+        if exc.code is None:
+            exit_code = 0
+        elif isinstance(exc.code, int) and not isinstance(exc.code, bool):
+            exit_code = exc.code
+        else:
+            exit_code = 1
+        raise
+    except KeyboardInterrupt:
+        exit_code = 130
+        raise
+    except BaseException:
+        exit_code = 1
+        raise
+    finally:
+        if args.command == "mine" and os.environ.get("MEMPALACE_MINE_PID_FILE"):
+            from ..miner import _arm_hook_mine_exit_watchdog
+
+            _arm_hook_mine_exit_watchdog(exit_code=exit_code)

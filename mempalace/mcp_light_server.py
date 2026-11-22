@@ -2,7 +2,7 @@
 """
 MemPalace Lightweight MCP Server
 ================================
-Consolidates 45 MemPalace tools into a high-performance 3-tool interface
+Consolidates 47 MemPalace tools into a high-performance 3-tool interface
 (`palace_query`, `palace_exec`, `palace_coordinate`) powered by Palace Query
 Language (PQL) and Command DSL, while retaining 100% of underlying features,
 guarantees, and safety checks.
@@ -16,30 +16,121 @@ import logging
 import os
 import sys
 import time
+from contextlib import nullcontext
 from typing import Any, Dict, Optional
 
-# stdio protection before heavy imports
+# Only the stdio entry point owns stdout. The HTTP hub imports this module.
 _REAL_STDOUT = sys.stdout
 _REAL_STDOUT_FD = None
-try:
-    _REAL_STDOUT_FD = os.dup(1)
-    os.dup2(2, 1)
-except (OSError, AttributeError):
-    pass
-sys.stdout = sys.stderr
+if __name__ == "__main__":
+    try:
+        _REAL_STDOUT_FD = os.dup(1)
+        os.dup2(2, 1)
+    except (OSError, AttributeError):
+        pass
+    sys.stdout = sys.stderr
 
-from .version import __version__  # noqa: E402
+import inspect  # noqa: E402
+import urllib.error  # noqa: E402
+
+from ._blas_threads import cap_server_blas_threads  # noqa: E402
+from .config import MempalaceConfig, normalize_wing_name  # noqa: E402
+from .hub_client import (  # noqa: E402
+    FORWARD_ERRORS,
+    SEARCH_TOOL_NAMES,
+    HubClient,
+    proxy_error_response,
+    search_settings_overridden,
+    tool_result,
+)
 from .query_parser import (  # noqa: E402
     QueryParseError,
     parse_coordinate_input,
     parse_exec_input,
     parse_query_input,
 )
-from . import mcp_server  # noqa: E402
+from .search_util import _cosine_scale_distance  # noqa: E402
+from .stored_text import dumps_client  # noqa: E402
+from .timeutil import recency_key  # noqa: E402
+from .tool_capabilities import (  # noqa: E402
+    READ_ONLY_REFUSED_TOOLS,
+    TOOL_CAPABILITIES,
+)
+from .version import __version__  # noqa: E402
 
-import inspect  # noqa: E402
+_SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
+_STDOUT_RESTORED = False
+_READ_ONLY = False
+_MCP_SERVER_MOD: Any = None
 
-logger = logging.getLogger("mempalace_mcp_light")
+
+def _import_mcp_server():
+    """Import ``mempalace.mcp_server`` preserving stdout when already restored."""
+    existing = sys.modules.get("mempalace.mcp_server")
+    if existing is not None:
+        return existing
+
+    saved_fd = None
+    saved_stdout = sys.stdout
+    if _STDOUT_RESTORED:
+        try:
+            saved_fd = os.dup(1)
+        except OSError:
+            saved_fd = None
+
+    import importlib
+
+    try:
+        mod = importlib.import_module("mempalace.mcp_server")
+    finally:
+        if _STDOUT_RESTORED:
+            if saved_fd is not None:
+                try:
+                    os.dup2(saved_fd, 1)
+                finally:
+                    os.close(saved_fd)
+            sys.stdout = saved_stdout
+    if _STDOUT_RESTORED:
+        dup_fd = getattr(mod, "_REAL_STDOUT_FD", None)
+        if isinstance(dup_fd, int) and dup_fd >= 0:
+            try:
+                os.close(dup_fd)
+            except OSError:
+                pass
+        mod._REAL_STDOUT = sys.stdout
+        mod._REAL_STDOUT_FD = None
+    return mod
+
+
+def _get_mcp_server():
+    """Return ``mempalace.mcp_server``, importing it lazily on first local dispatch."""
+    global _MCP_SERVER_MOD
+    if "mcp_server" in globals() and globals()["mcp_server"] is not None:
+        return globals()["mcp_server"]
+    if _MCP_SERVER_MOD is not None:
+        globals()["mcp_server"] = _MCP_SERVER_MOD
+        return _MCP_SERVER_MOD
+    mod = _import_mcp_server()
+    _MCP_SERVER_MOD = mod
+    globals()["mcp_server"] = mod
+    return mod
+
+
+def _mcp_server_loaded() -> bool:
+    return (
+        ("mcp_server" in globals() and globals()["mcp_server"] is not None)
+        or _MCP_SERVER_MOD is not None
+        or "mempalace.mcp_server" in sys.modules
+    )
+
+
+def __getattr__(name: str):
+    if name == "mcp_server":
+        return _get_mcp_server()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+logger = logging.getLogger(__name__)
 
 _PQL_KEYWORDS = {
     "FIND",
@@ -116,12 +207,25 @@ def _unwrap_wrapper_input(arguments: Any) -> Any:
     return arguments
 
 
-def _call_handler_safe(handler, params: Dict[str, Any]) -> Dict[str, Any]:
-    """Invoke handler safely by filtering extra kwargs that the handler doesn't accept."""
-    if not callable(handler):
-        return {"success": False, "error": f"Handler {handler} is not callable"}
-    mapped = _alias_args_for_handler(handler, params)
+def _call_handler_safe(name: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Run tool ``name`` with the kwargs its handler accepts, checked like any tools/call."""
+    srv = _get_mcp_server()
+    handler = srv.TOOLS[name]["handler"]
+    try:
+        mapped = srv.validate_tool_arguments(name, _alias_args_for_handler(handler, params))
+    except srv.ToolArgumentError as e:
+        return {"success": False, "error": f"Invalid params for tool {name}: {e}"}
     return handler(**mapped)
+
+
+def _match_fuzzy_wing(wing: str, known) -> str:
+    if wing in known:
+        return wing
+    w_low = wing.lower()
+    matches = [
+        kw for kw in known if str(kw).lower() == w_low or str(kw).lower().endswith(f"_{w_low}")
+    ]
+    return matches[0] if len(matches) == 1 else wing
 
 
 def _resolve_fuzzy_wing(wing: Optional[str]) -> Optional[str]:
@@ -129,19 +233,9 @@ def _resolve_fuzzy_wing(wing: Optional[str]) -> Optional[str]:
     if not wing:
         return wing
     try:
-        wings_resp = mcp_server.tool_list_wings()
+        wings_resp = _get_mcp_server().tool_list_wings()
         if isinstance(wings_resp, dict) and "wings" in wings_resp:
-            known = wings_resp["wings"]
-            if wing in known:
-                return wing
-            w_low = wing.lower()
-            matches = [
-                kw
-                for kw in known
-                if str(kw).lower() == w_low or str(kw).lower().endswith(f"_{w_low}")
-            ]
-            if len(matches) == 1:
-                return matches[0]
+            return _match_fuzzy_wing(wing, wings_resp["wings"])
     except Exception:
         pass
     return wing
@@ -164,7 +258,53 @@ def _search_timestamp(item: Dict[str, Any]) -> str:
     return str(value)
 
 
-def _enrich_search_results(res: Dict[str, Any]) -> Dict[str, Any]:
+def _follow_tunnels_from_disk(palace_path: str, wing: str, room: str) -> list:
+    """Read explicit tunnel connections from ``tunnels.json`` without loading ``mcp_server``."""
+    tunnels_file = MempalaceConfig(palace_path=palace_path).tunnel_file
+    try:
+        with open(tunnels_file, encoding="utf-8") as f:
+            tunnels = json.load(f)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(tunnels, list):
+        return []
+    norm_wing = normalize_wing_name(wing) or wing
+    connections = []
+    for t in tunnels:
+        if not isinstance(t, dict):
+            continue
+        src = t.get("source") or {}
+        tgt = t.get("target") or {}
+        if normalize_wing_name(str(src.get("wing") or "")) == norm_wing and src.get("room") == room:
+            connections.append(
+                {
+                    "direction": "outgoing",
+                    "connected_wing": tgt.get("wing", ""),
+                    "connected_room": tgt.get("room", ""),
+                    "label": t.get("label", ""),
+                    "drawer_id": tgt.get("drawer_id"),
+                    "tunnel_id": t.get("id", ""),
+                }
+            )
+        elif (
+            normalize_wing_name(str(tgt.get("wing") or "")) == norm_wing and tgt.get("room") == room
+        ):
+            connections.append(
+                {
+                    "direction": "incoming",
+                    "connected_wing": src.get("wing", ""),
+                    "connected_room": src.get("room", ""),
+                    "label": t.get("label", ""),
+                    "drawer_id": src.get("drawer_id"),
+                    "tunnel_id": t.get("id", ""),
+                }
+            )
+    return connections
+
+
+def _enrich_search_results(
+    res: Dict[str, Any], *, palace_path: Optional[str] = None
+) -> Dict[str, Any]:
     """Tag search hits with confidence/recency; keep searcher ranking."""
     if not isinstance(res, dict) or "results" not in res:
         return res
@@ -176,7 +316,13 @@ def _enrich_search_results(res: Dict[str, Any]) -> Dict[str, Any]:
         res["summary"] = "No matching memories found in the palace for this query."
         return res
 
-    distances = [d for d in (_search_distance(item) for item in results_list) if d is not None]
+    # The bands are on the cosine scale; the raw distance may be l2 or ip.
+    metric = res.get("distance_metric") or "cosine"
+    distances = [
+        _cosine_scale_distance(d, metric)
+        for d in (_search_distance(item) for item in results_list)
+        if d is not None
+    ]
     if distances:
         min_dist = min(distances)
         if min_dist > 0.52:
@@ -188,7 +334,7 @@ def _enrich_search_results(res: Dict[str, Any]) -> Dict[str, Any]:
 
     by_recency = sorted(
         range(len(results_list)),
-        key=lambda i: _search_timestamp(results_list[i]),
+        key=lambda i: recency_key(_search_timestamp(results_list[i])),
         reverse=True,
     )
     for recency_rank, orig_i in enumerate(by_recency, 1):
@@ -204,7 +350,11 @@ def _enrich_search_results(res: Dict[str, Any]) -> Dict[str, Any]:
     top_room = top_item.get("room")
     if top_wing and top_room:
         try:
-            tunnel_res = mcp_server.tool_follow_tunnels(top_wing, top_room)
+            # Decoration of a search hit, not an agent crossing the tunnel.
+            if palace_path and not _mcp_server_loaded():
+                tunnel_res = _follow_tunnels_from_disk(palace_path, top_wing, top_room)
+            else:
+                tunnel_res = _get_mcp_server().tool_follow_tunnels(top_wing, top_room, record=False)
             if isinstance(tunnel_res, dict) and tunnel_res.get("error"):
                 connections = []
             elif isinstance(tunnel_res, list):
@@ -236,62 +386,18 @@ def tool_palace_query(arguments: Dict[str, Any] | str) -> Dict[str, Any]:
     except QueryParseError as e:
         return {"success": False, "error": f"PQL query parse error: {e}"}
 
-    # Resolve fuzzy wing names
-    if "wing" in params and isinstance(params["wing"], str):
-        params["wing"] = _resolve_fuzzy_wing(params["wing"])
-
-    # Dispatch to underlying handlers in mcp_server
-    if target in ("search", "find"):
-        raw_res = _call_handler_safe(mcp_server.tool_search, params)
-        return _enrich_search_results(raw_res)
-    elif target in ("taxonomy", "get_taxonomy"):
-        res = mcp_server.tool_get_taxonomy()
-        wing = params.get("wing")
-        if wing and isinstance(res, dict) and "taxonomy" in res:
-            tax = res["taxonomy"]
-            return {"taxonomy": {wing: tax.get(wing, {})}} if wing in tax else {"taxonomy": {}}
-        return res
-    elif target in ("wings", "list_wings"):
-        return mcp_server.tool_list_wings()
-    elif target in ("rooms", "list_rooms"):
-        return _call_handler_safe(mcp_server.tool_list_rooms, params)
-    elif target in ("drawer", "get_drawer"):
-        return _call_handler_safe(mcp_server.tool_get_drawer, params)
-    elif target in ("drawers", "list_drawers"):
-        return _call_handler_safe(mcp_server.tool_list_drawers, params)
-    elif target in ("check_duplicate", "duplicate", "check"):
-        return _call_handler_safe(mcp_server.tool_check_duplicate, params)
-    elif target in ("aaak_spec", "aaak", "get_aaak_spec"):
-        return mcp_server.tool_get_aaak_spec()
-    elif target in ("kg_query", "kg"):
-        return _call_handler_safe(mcp_server.tool_kg_query, params)
-    elif target in ("kg_timeline", "timeline"):
-        return _call_handler_safe(mcp_server.tool_kg_timeline, params)
-    elif target in ("kg_stats", "kg_statistics"):
-        return mcp_server.tool_kg_stats()
-    elif target in ("traverse", "traverse_graph"):
-        return _call_handler_safe(mcp_server.tool_traverse_graph, params)
-    elif target in ("find_tunnels",):
-        return _call_handler_safe(mcp_server.tool_find_tunnels, params)
-    elif target in ("list_tunnels", "tunnels"):
-        return _call_handler_safe(mcp_server.tool_list_tunnels, params)
-    elif target in ("follow_tunnels", "follow"):
-        return _call_handler_safe(mcp_server.tool_follow_tunnels, params)
-    elif target in ("list_hallways", "hallways"):
-        return _call_handler_safe(mcp_server.tool_list_hallways, params)
-    elif target in ("graph_stats", "stats"):
-        return mcp_server.tool_graph_stats()
-    elif target in ("diary_read", "diary"):
-        return _call_handler_safe(mcp_server.tool_diary_read, params)
-    elif target in ("status",):
-        res = mcp_server.tool_status()
-        return mcp_server._decorate_mcp_tool_result("mempalace_status", res)
-    elif target in ("filed", "memories_filed_away"):
-        return mcp_server.tool_memories_filed_away()
-    elif target in ("settings", "hook_settings"):
-        return mcp_server.tool_hook_settings()
-    else:
+    _resolve_wing_params(params)
+    name = _allowlisted_tool(_QUERY_TARGET_TO_TOOL, target)
+    if name is None:
         return {"success": False, "error": f"Unknown palace_query target: '{target}'"}
+    res = _call_handler_safe(name, _query_arguments(name, params))
+    if name == "mempalace_search":
+        return _enrich_search_results(res)
+    if name == "mempalace_get_taxonomy" and params.get("wing") and isinstance(res, dict):
+        return _filter_taxonomy_payload(res, params["wing"]) if "taxonomy" in res else res
+    if name == "mempalace_status":
+        return _get_mcp_server()._decorate_mcp_tool_result(name, res)
+    return res
 
 
 def tool_palace_exec(arguments: Dict[str, Any] | str) -> Dict[str, Any]:
@@ -303,51 +409,11 @@ def tool_palace_exec(arguments: Dict[str, Any] | str) -> Dict[str, Any]:
     except QueryParseError as e:
         return {"success": False, "error": f"PQL exec parse error: {e}"}
 
-    # Dispatch to underlying handlers
-    if action == "add_drawer":
-        if "wing" in params:
-            params["wing"] = _resolve_fuzzy_wing(params["wing"])
-        return _call_handler_safe(mcp_server.tool_add_drawer, params)
-    elif action == "update_drawer":
-        if "wing" in params:
-            params["wing"] = _resolve_fuzzy_wing(params["wing"])
-        return _call_handler_safe(mcp_server.tool_update_drawer, params)
-    elif action == "delete_drawer":
-        return _call_handler_safe(mcp_server.tool_delete_drawer, params)
-    elif action == "delete_by_source":
-        return _call_handler_safe(mcp_server.tool_delete_by_source, params)
-    elif action == "checkpoint":
-        return _call_handler_safe(mcp_server.tool_checkpoint, params)
-    elif action == "mine":
-        return _call_handler_safe(mcp_server.tool_mine, params)
-    elif action == "sync":
-        return _call_handler_safe(mcp_server.tool_sync, params)
-    elif action == "kg_add":
-        return _call_handler_safe(mcp_server.tool_kg_add, params)
-    elif action == "kg_invalidate":
-        return _call_handler_safe(mcp_server.tool_kg_invalidate, params)
-    elif action == "kg_supersede":
-        return _call_handler_safe(mcp_server.tool_kg_supersede, params)
-    elif action == "create_tunnel":
-        if "source_wing" in params:
-            params["source_wing"] = _resolve_fuzzy_wing(params["source_wing"])
-        if "target_wing" in params:
-            params["target_wing"] = _resolve_fuzzy_wing(params["target_wing"])
-        return _call_handler_safe(mcp_server.tool_create_tunnel, params)
-    elif action == "delete_tunnel":
-        return _call_handler_safe(mcp_server.tool_delete_tunnel, params)
-    elif action == "delete_hallway":
-        return _call_handler_safe(mcp_server.tool_delete_hallway, params)
-    elif action == "diary_write":
-        if "wing" in params:
-            params["wing"] = _resolve_fuzzy_wing(params["wing"])
-        return _call_handler_safe(mcp_server.tool_diary_write, params)
-    elif action == "reconnect":
-        return mcp_server.tool_reconnect()
-    elif action == "hook_settings":
-        return _call_handler_safe(mcp_server.tool_hook_settings, params)
-    else:
+    _resolve_wing_params(params)
+    name = _allowlisted_tool(_EXEC_ACTION_TO_TOOL, action)
+    if name is None:
         return {"success": False, "error": f"Unknown palace_exec action: '{action}'"}
+    return _call_handler_safe(name, params)
 
 
 def tool_palace_coordinate(arguments: Dict[str, Any] | str) -> Dict[str, Any]:
@@ -359,26 +425,10 @@ def tool_palace_coordinate(arguments: Dict[str, Any] | str) -> Dict[str, Any]:
     except QueryParseError as e:
         return {"success": False, "error": f"PQL coordinate parse error: {e}"}
 
-    if action == "task_create":
-        return _call_handler_safe(mcp_server.tool_task_create, params)
-    elif action == "event_append":
-        return _call_handler_safe(mcp_server.tool_event_append, params)
-    elif action == "event_list":
-        return _call_handler_safe(mcp_server.tool_event_list, params)
-    elif action == "event_wait":
-        return _call_handler_safe(mcp_server.tool_event_wait, params)
-    elif action == "event_ack":
-        return _call_handler_safe(mcp_server.tool_event_ack, params)
-    elif action == "artifact_put":
-        return _call_handler_safe(mcp_server.tool_artifact_put, params)
-    elif action == "artifact_get":
-        return _call_handler_safe(mcp_server.tool_artifact_get, params)
-    elif action == "patch_submit":
-        return _call_handler_safe(mcp_server.tool_patch_submit, params)
-    elif action in ("mesh_peers", "peers"):
-        return mcp_server.tool_mesh_peers()
-    else:
+    name = _allowlisted_tool(_COORD_ACTION_TO_TOOL, action)
+    if name is None:
         return {"success": False, "error": f"Unknown palace_coordinate action: '{action}'"}
+    return _call_handler_safe(name, params)
 
 
 # ==================== LIGHTWEIGHT MCP TOOL DEFINITIONS ====================
@@ -449,8 +499,8 @@ LIGHT_TOOLS = {
                 },
                 "candidate_strategy": {
                     "type": "string",
-                    "enum": ["vector", "union"],
-                    "description": "Search candidate strategy (optional)",
+                    "enum": ["vector", "union", "lexical"],
+                    "description": "Search candidate strategy: vector, union, or lexical (optional)",
                 },
                 "source_file": {
                     "type": "string",
@@ -601,7 +651,11 @@ LIGHT_TOOLS = {
                 "project": {"type": "string", "description": "Project routing name (optional)"},
                 "stream": {"type": "string", "description": "Logical stream (optional)"},
                 "room": {"type": "string", "description": "Sub-channel (optional)"},
-                "from_agent": {"type": "string", "description": "Writer agent identity (optional)"},
+                "from_agent": {
+                    "type": "string",
+                    "description": "Your identity (never filters; use writer)",
+                },
+                "writer": {"type": "string", "description": "List/wait: filter by event writer"},
                 "to_agent": {"type": "string", "description": "Target agent identity (optional)"},
                 "goal": {"type": "string", "description": "Task goal (optional)"},
                 "branch": {"type": "string", "description": "Git branch (optional)"},
@@ -658,7 +712,7 @@ LIGHT_TOOLS = {
 
 def _restore_stdout():
     """Restore stdout descriptor for the JSON-RPC stdio transport."""
-    global _REAL_STDOUT_FD
+    global _REAL_STDOUT_FD, _STDOUT_RESTORED
     if _REAL_STDOUT_FD is not None:
         try:
             os.dup2(_REAL_STDOUT_FD, 1)
@@ -667,10 +721,13 @@ def _restore_stdout():
         except OSError:
             pass
     sys.stdout = _REAL_STDOUT
+    _STDOUT_RESTORED = True
     # mcp_server dup'd fd 1 after we had already redirected it to stderr.
     # Keep it from later restoring that captured stderr onto protocol stdout.
-    mcp_server._REAL_STDOUT = sys.stdout
-    mcp_server._REAL_STDOUT_FD = None
+    if _mcp_server_loaded():
+        srv = _get_mcp_server()
+        srv._REAL_STDOUT = sys.stdout
+        srv._REAL_STDOUT_FD = None
 
 
 _QUERY_TARGET_TO_TOOL = {
@@ -681,6 +738,7 @@ _QUERY_TARGET_TO_TOOL = {
     "kg_timeline": "mempalace_kg_timeline",
     "timeline": "mempalace_kg_timeline",
     "kg_stats": "mempalace_kg_stats",
+    "kg_statistics": "mempalace_kg_stats",
     "rooms": "mempalace_list_rooms",
     "list_rooms": "mempalace_list_rooms",
     "wings": "mempalace_list_wings",
@@ -717,37 +775,127 @@ _QUERY_TARGET_TO_TOOL = {
     "stats": "mempalace_graph_stats",
 }
 
+# palace_exec / palace_coordinate actions the production rewrite may dispatch.
+# Anything absent is an unknown target (-32602), never ``mempalace_<action>``.
+_EXEC_ACTION_TO_TOOL = {
+    "add_drawer": "mempalace_add_drawer",
+    "update_drawer": "mempalace_update_drawer",
+    "delete_drawer": "mempalace_delete_drawer",
+    "delete_by_source": "mempalace_delete_by_source",
+    "checkpoint": "mempalace_checkpoint",
+    "mine": "mempalace_mine",
+    "sync": "mempalace_sync",
+    "kg_add": "mempalace_kg_add",
+    "kg_invalidate": "mempalace_kg_invalidate",
+    "kg_supersede": "mempalace_kg_supersede",
+    "create_tunnel": "mempalace_create_tunnel",
+    "delete_tunnel": "mempalace_delete_tunnel",
+    "delete_hallway": "mempalace_delete_hallway",
+    "diary_write": "mempalace_diary_write",
+    "reconnect": "mempalace_reconnect",
+    "hook_settings": "mempalace_hook_settings",
+}
 
-def _classify_underlying_tool(tool_name: str, arguments: Any) -> str:
-    """Map a consolidated lightweight tool call to its underlying legacy tool name for preflight gates."""
+_COORD_ACTION_TO_TOOL = {
+    "task_create": "mempalace_task_create",
+    "event_append": "mempalace_event_append",
+    "event_list": "mempalace_event_list",
+    "event_wait": "mempalace_event_wait",
+    "event_ack": "mempalace_event_ack",
+    "artifact_put": "mempalace_artifact_put",
+    "artifact_get": "mempalace_artifact_get",
+    "patch_submit": "mempalace_patch_submit",
+    "mesh_peers": "mempalace_mesh_peers",
+    # Structured ``{"action": "peers"}`` is not rewritten by the PQL parser.
+    "peers": "mempalace_mesh_peers",
+}
+
+
+def _allowlisted_tool(mapping: Dict[str, str], key: str) -> Optional[str]:
+    """Return the mempalace_* name for an allowlisted key, else None."""
+    name = mapping.get(key)
+    if not isinstance(name, str):
+        return None
+    if _mcp_server_loaded():
+        return name if name in _get_mcp_server().TOOLS else None
+    return name if name in TOOL_CAPABILITIES else None
+
+
+def _query_arguments(name: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    """palace_query reads settings; the arguments that would change them are dropped."""
+    return {} if name == "mempalace_hook_settings" else params
+
+
+def _resolve_wing_params(params: Dict[str, Any], *, read_lock=nullcontext) -> None:
+    keys = [
+        key for key in ("wing", "source_wing", "target_wing") if isinstance(params.get(key), str)
+    ]
+    if keys:
+        with read_lock():
+            for key in keys:
+                params[key] = _resolve_fuzzy_wing(params[key])
+
+
+def _classify_underlying_tool(tool_name: str, arguments: Any) -> Optional[str]:
+    """Map a palace_* call to an allowlisted mempalace_* tool.
+
+    Unknown targets are None. They are not invented as ``mempalace_<target>``.
+    A parse failure still names a real mutating tool so preflight keeps
+    treating an unreadable exec or coordinate call as a write.
+    """
     unwrapped = _unwrap_wrapper_input(arguments)
     if tool_name == "palace_exec":
         try:
             action, _ = parse_exec_input(unwrapped)
-            return f"mempalace_{action}"
         except Exception:
             return "mempalace_add_drawer"
+        return _allowlisted_tool(_EXEC_ACTION_TO_TOOL, action)
 
     if tool_name == "palace_coordinate":
         try:
             action, _ = parse_coordinate_input(unwrapped)
-            return f"mempalace_{action}"
         except Exception:
             return "mempalace_event_append"
+        return _allowlisted_tool(_COORD_ACTION_TO_TOOL, action)
 
     if tool_name == "palace_query":
         try:
             target, _ = parse_query_input(unwrapped)
-            return _QUERY_TARGET_TO_TOOL.get(target, f"mempalace_{target}")
         except Exception:
             return "mempalace_search"
+        return _allowlisted_tool(_QUERY_TARGET_TO_TOOL, target)
 
-    return tool_name
+    if isinstance(tool_name, str):
+        known_tools = _get_mcp_server().TOOLS if _mcp_server_loaded() else TOOL_CAPABILITIES
+        if tool_name in known_tools:
+            return tool_name
+    return None
+
+
+def _unknown_target_error(req_id) -> Dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {"code": -32602, "message": "unknown target"},
+    }
+
+
+def _is_read_only() -> bool:
+    if _mcp_server_loaded():
+        return bool(_get_mcp_server()._READ_ONLY)
+    return _READ_ONLY
+
+
+def _supported_protocol_versions():
+    if _mcp_server_loaded():
+        return _get_mcp_server().SUPPORTED_PROTOCOL_VERSIONS
+    return _SUPPORTED_PROTOCOL_VERSIONS
 
 
 def handle_light_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Process a single JSON-RPC request for the lightweight MCP server."""
-    mcp_server._last_request_time = time.monotonic()
+    if _mcp_server_loaded():
+        _get_mcp_server()._last_request_time = time.monotonic()
     if not isinstance(request, dict) or request.get("jsonrpc") != "2.0":
         return {
             "jsonrpc": "2.0",
@@ -755,17 +903,18 @@ def handle_light_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "error": {"code": -32600, "message": "Invalid Request"},
         }
 
-    method = request.get("method") or ""
-    params = request.get("params") or {}
+    method = request.get("method")
+    if not isinstance(method, str):
+        method = ""
+    params = request.get("params")
+    if not isinstance(params, dict):
+        params = {}
     req_id = request.get("id")
 
     if method == "initialize":
-        client_version = params.get("protocolVersion", mcp_server.SUPPORTED_PROTOCOL_VERSIONS[-1])
-        negotiated = (
-            client_version
-            if client_version in mcp_server.SUPPORTED_PROTOCOL_VERSIONS
-            else mcp_server.SUPPORTED_PROTOCOL_VERSIONS[0]
-        )
+        versions = _supported_protocol_versions()
+        client_version = params.get("protocolVersion", versions[-1])
+        negotiated = client_version if client_version in versions else versions[0]
         return {
             "jsonrpc": "2.0",
             "id": req_id,
@@ -775,15 +924,16 @@ def handle_light_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 "serverInfo": {"name": "mempalace-light", "version": __version__},
             },
         }
-    elif method == "ping":
+    if method == "ping":
         return {"jsonrpc": "2.0", "id": req_id, "result": {}}
-    elif method.startswith("notifications/"):
+    if method.startswith("notifications/"):
         return None
-    elif method == "tools/list":
+    if method == "tools/list":
         # In read-only mode, only palace_query is exposed
         tools_list = []
+        read_only = _is_read_only()
         for name, tool_def in LIGHT_TOOLS.items():
-            if mcp_server._READ_ONLY and name in ("palace_exec", "palace_coordinate"):
+            if read_only and name in ("palace_exec", "palace_coordinate"):
                 continue
             tools_list.append(
                 {
@@ -797,8 +947,8 @@ def handle_light_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "id": req_id,
             "result": {"tools": tools_list},
         }
-    elif method == "tools/call":
-        if not isinstance(params, dict) or "name" not in params:
+    if method == "tools/call":
+        if not isinstance(params.get("name"), str):
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
@@ -815,15 +965,22 @@ def handle_light_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
         arguments = params.get("arguments") or {}
 
-        # Classify underlying tool for preflight gates (read-only, peer-writer, stale-library, diverged-index)
+        # Same allowlist the production rewrite uses. An unknown palace_*
+        # target is -32602 here too, so this path cannot dispatch a write
+        # the rewrite would refuse.
         underlying_name = _classify_underlying_tool(tool_name, arguments)
-        refusal = mcp_server._mcp_tool_preflight_refusal(req_id, underlying_name)
+        if not underlying_name:
+            return _unknown_target_error(req_id)
+        srv = _get_mcp_server()
+        # A writer lease the preflight takes lasts this call only (see call_tool).
+        lease_held_before = srv._MCP_WRITER_LOCK_CM is not None
+        refusal = srv._mcp_tool_preflight_refusal(req_id, underlying_name)
         if refusal is not None:
             return refusal
 
         try:
             handler = LIGHT_TOOLS[tool_name]["handler"]
-            with mcp_server._write_stall_watch(underlying_name):
+            with srv._write_stall_watch(underlying_name):
                 result = handler(arguments)
             return {
                 "jsonrpc": "2.0",
@@ -840,7 +997,11 @@ def handle_light_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 },
             }
         except Exception as e:
-            return mcp_server._internal_tool_error(req_id, tool_name, e)
+            return srv._internal_tool_error(
+                req_id, tool_name, e, include_message=isinstance(e, ValueError)
+            )
+        finally:
+            srv._end_call_writer_lease(lease_held_before)
 
     if req_id is None:
         return None
@@ -851,14 +1012,11 @@ def handle_light_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
-def _alias_args_for_handler(handler, params: Dict[str, Any]) -> Dict[str, Any]:
-    """Translate PQL field names to the underlying handler's parameter names."""
+def _alias_args_for_names(
+    names, params: Dict[str, Any], *, has_var_keyword: bool = False
+) -> Dict[str, Any]:
+    """Translate PQL field names to an underlying tool's parameter names."""
     mapped = dict(params)
-    try:
-        sig = inspect.signature(handler)
-    except (TypeError, ValueError):
-        return mapped
-    names = sig.parameters
     if "entity" in mapped and "entity_name" in names and "entity_name" not in mapped:
         mapped["entity_name"] = mapped.pop("entity")
     if "agent" in mapped and "agent_name" in names and "agent_name" not in mapped:
@@ -879,16 +1037,26 @@ def _alias_args_for_handler(handler, params: Dict[str, Any]) -> Dict[str, Any]:
         mapped["old_object"] = mapped.pop("old")
     if "new" in mapped and "new_object" in names and "new_object" not in mapped:
         mapped["new_object"] = mapped.pop("new")
-    has_var_keyword = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in names.values())
     if has_var_keyword:
         return mapped
     return {k: v for k, v in mapped.items() if k in names}
 
 
-def _rewrite_tools_call_for_hub(request: Dict[str, Any]):
+def _alias_args_for_handler(handler, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Translate PQL field names to the underlying handler's parameter names."""
+    try:
+        sig = inspect.signature(handler)
+    except (TypeError, ValueError):
+        return dict(params)
+    names = sig.parameters
+    has_var_keyword = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in names.values())
+    return _alias_args_for_names(names, params, has_var_keyword=has_var_keyword)
+
+
+def _rewrite_tools_call_for_hub(request: Dict[str, Any], *, read_lock=nullcontext):
     """Translate palace_* tools/call into the underlying mempalace_* JSON-RPC."""
     params = request.get("params") or {}
-    if not isinstance(params, dict) or "name" not in params:
+    if not isinstance(params, dict) or not isinstance(params.get("name"), str):
         return None
     tool_name = params["name"]
     if tool_name not in LIGHT_TOOLS:
@@ -908,14 +1076,16 @@ def _rewrite_tools_call_for_hub(request: Dict[str, Any]):
 
     taxonomy_wing = None
     if tool_name in ("palace_query", "palace_exec"):
-        for key in ("wing", "source_wing", "target_wing"):
-            if isinstance(parsed.get(key), str):
-                parsed[key] = _resolve_fuzzy_wing(parsed[key])
+        _resolve_wing_params(parsed, read_lock=read_lock)
         if tool_name == "palace_query" and query_target in ("taxonomy", "get_taxonomy"):
             taxonomy_wing = parsed.get("wing")
 
     underlying = _classify_underlying_tool(tool_name, arguments)
-    tool_def = mcp_server.TOOLS.get(underlying) or {}
+    if not underlying:
+        return {"_unknown_target": True}
+    if tool_name == "palace_query":
+        parsed = _query_arguments(underlying, parsed)
+    tool_def = _get_mcp_server().TOOLS.get(underlying) or {}
     handler = tool_def.get("handler")
     if handler is not None:
         parsed = _alias_args_for_handler(handler, parsed)
@@ -936,7 +1106,13 @@ def _filter_taxonomy_payload(payload: Dict[str, Any], wing: str) -> Dict[str, An
     return {"taxonomy": {}}
 
 
-def _postprocess_light_response(rewritten: Dict[str, Any], resp: Optional[Dict[str, Any]]):
+def _postprocess_light_response(
+    rewritten: Dict[str, Any],
+    resp: Optional[Dict[str, Any]],
+    *,
+    palace_path: Optional[str] = None,
+    read_lock=nullcontext,
+):
     if not resp or "result" not in resp:
         return resp
     underlying = ((rewritten.get("params") or {}).get("name")) or ""
@@ -958,18 +1134,319 @@ def _postprocess_light_response(rewritten: Dict[str, Any], resp: Optional[Dict[s
     if not isinstance(payload, dict):
         return resp
     if underlying == "mempalace_search":
-        payload = _enrich_search_results(payload)
+        with read_lock():
+            payload = _enrich_search_results(payload, palace_path=palace_path)
     elif underlying == "mempalace_get_taxonomy":
         payload = _filter_taxonomy_payload(payload, taxonomy_wing)
     content[0]["text"] = json.dumps(payload, ensure_ascii=False, indent=2)
     return resp
 
 
+def _stdio_reply_light(line: str, dispatch) -> Optional[str]:
+    """Parse one JSON-RPC line and serialize the response without importing ``mcp_server``."""
+    try:
+        request = json.loads(line)
+    except Exception as exc:
+        logger.error("Server error: %s: %s", type(exc).__name__, exc)
+        return dumps_client(
+            {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}
+        )
+    try:
+        response = dispatch(request)
+    except Exception:
+        logger.exception("Server error")
+        req_id = request.get("id") if isinstance(request, dict) else None
+        if req_id is None:
+            return None
+        return dumps_client(
+            {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32603, "message": "Internal error"},
+            }
+        )
+    return None if response is None else dumps_client(response)
+
+
+def _hub_for_light_session(args) -> Optional[HubClient]:
+    """Return the live hub for a plain stdio light session, or None."""
+    if (
+        getattr(args, "read_only", False)
+        or getattr(args, "backend", None)
+        or getattr(args, "collection", None)
+    ):
+        return None
+    palace_path = getattr(args, "palace", None)
+    if not palace_path:
+        try:
+            palace_path = MempalaceConfig().palace_path
+        except Exception:
+            return None
+    return HubClient.discover(palace_path)
+
+
+class _LightHubProxy:
+    """Thin hub-forwarding dispatcher for ``mempalace-light-mcp``.
+
+    Keeps ``mempalace.mcp_server`` (and with it ``chromadb`` and ``numpy``)
+    unloaded while a live hub is serving the palace.
+    """
+
+    def __init__(self, hub: HubClient, palace_path: str) -> None:
+        self.hub: Optional[HubClient] = hub
+        self.base_url = hub.base_url
+        self.palace_path = palace_path
+        self._tool_schemas: Optional[Dict[str, set]] = None
+        self._wings_cache: Optional[list] = None
+        self._local_initialized = False
+
+    def _set_hub(self, hub: HubClient) -> None:
+        self.hub = hub
+        self.base_url = hub.base_url
+        self._tool_schemas = None
+        self._wings_cache = None
+
+    def _forward(self, request: Dict[str, Any]):
+        if self.hub is None:
+            raise urllib.error.URLError("hub unavailable")
+        return self.hub.post(request)
+
+    def _known_wings(self) -> list:
+        if self._wings_cache is not None:
+            return self._wings_cache
+        resp = self._forward(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "mempalace_list_wings", "arguments": {}},
+            }
+        )
+        try:
+            payload = tool_result(resp)
+        except (KeyError, IndexError, TypeError, ValueError):
+            return []
+        wings = payload.get("wings") if isinstance(payload, dict) else None
+        if isinstance(wings, dict):
+            self._wings_cache = list(wings.keys())
+            return self._wings_cache
+        if isinstance(wings, list):
+            self._wings_cache = list(wings)
+            return self._wings_cache
+        return []
+
+    def _param_names_for(self, tool_name: str) -> Optional[set]:
+        if self._tool_schemas is None:
+            resp = self._forward({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
+            tools = ((resp or {}).get("result") or {}).get("tools") or []
+            schemas: Dict[str, set] = {}
+            for entry in tools:
+                if not isinstance(entry, dict) or "name" not in entry:
+                    continue
+                props = ((entry.get("inputSchema") or {}).get("properties")) or {}
+                if isinstance(props, dict):
+                    schemas[entry["name"]] = set(props.keys())
+            self._tool_schemas = schemas
+        return self._tool_schemas.get(tool_name)
+
+    def _resolve_wings(self, params: Dict[str, Any]) -> None:
+        wing_keys = [
+            k for k in ("wing", "source_wing", "target_wing") if isinstance(params.get(k), str)
+        ]
+        if not wing_keys:
+            return
+        known = self._known_wings()
+        if not known:
+            return
+        for key in wing_keys:
+            params[key] = _match_fuzzy_wing(params[key], known)
+
+    def _fallback_local(self, request: Dict[str, Any], *, degraded: bool = False):
+        if not self._local_initialized:
+            srv = _get_mcp_server()
+            srv._apply_server_flags(palace=self.palace_path or None)
+            for start in (srv._start_idle_exit_watchdog, srv._start_write_stall_watchdog):
+                try:
+                    start()
+                except Exception:
+                    logger.debug("watchdog did not start", exc_info=True)
+            self._local_initialized = True
+        resp = dispatch_light_stdio_request(request)
+        if degraded:
+            from .mcp_proxy import _annotate_degraded
+
+            resp = _annotate_degraded(resp)
+        return resp
+
+    def _dispatch_to_hub(
+        self,
+        request: Dict[str, Any],
+        tool_name: str,
+        query_target: Optional[str],
+        underlying: str,
+        raw_parsed: Dict[str, Any],
+    ):
+        parsed = dict(raw_parsed)
+        taxonomy_wing = None
+        if tool_name in ("palace_query", "palace_exec"):
+            self._resolve_wings(parsed)
+            if tool_name == "palace_query" and query_target in ("taxonomy", "get_taxonomy"):
+                taxonomy_wing = parsed.get("wing")
+        if tool_name == "palace_query":
+            parsed = _query_arguments(underlying, parsed)
+
+        schema_names = self._param_names_for(underlying)
+        if schema_names is not None:
+            parsed = _alias_args_for_names(schema_names, parsed)
+        forwarded = {
+            "jsonrpc": request.get("jsonrpc", "2.0"),
+            "id": request.get("id"),
+            "method": "tools/call",
+            "params": {"name": underlying, "arguments": parsed},
+        }
+        resp = self._forward(forwarded)
+        return forwarded, taxonomy_wing, resp
+
+    def handle(self, request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not isinstance(request, dict) or request.get("jsonrpc") != "2.0":
+            return {
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {"code": -32600, "message": "Invalid Request"},
+            }
+        method = request.get("method") or ""
+        if method != "tools/call":
+            return handle_light_request(request)
+
+        params = request.get("params") or {}
+        if not isinstance(params, dict) or "name" not in params:
+            return {
+                "jsonrpc": "2.0",
+                "id": request.get("id"),
+                "error": {"code": -32602, "message": "Invalid params: name required"},
+            }
+        tool_name = params["name"]
+        if tool_name not in LIGHT_TOOLS:
+            return {
+                "jsonrpc": "2.0",
+                "id": request.get("id"),
+                "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"},
+            }
+
+        arguments = params.get("arguments") or {}
+        unwrapped = _unwrap_wrapper_input(arguments)
+        query_target = None
+        try:
+            if tool_name == "palace_query":
+                query_target, parsed = parse_query_input(unwrapped)
+            elif tool_name == "palace_exec":
+                _, parsed = parse_exec_input(unwrapped)
+            else:
+                _, parsed = parse_coordinate_input(unwrapped)
+        except (QueryParseError, ValueError, TypeError) as exc:
+            payload = {"success": False, "error": f"PQL parse error: {exc}"}
+            return {
+                "jsonrpc": "2.0",
+                "id": request.get("id"),
+                "result": {
+                    "content": [
+                        {"type": "text", "text": json.dumps(payload, ensure_ascii=False, indent=2)}
+                    ]
+                },
+            }
+
+        underlying = _classify_underlying_tool(tool_name, arguments)
+        if not underlying:
+            return _unknown_target_error(request.get("id"))
+
+        if underlying in SEARCH_TOOL_NAMES and search_settings_overridden():
+            return self._fallback_local(request, degraded=False)
+
+        if self.hub is None:
+            rediscovered = HubClient.discover(self.palace_path) if self.palace_path else None
+            if rediscovered is None:
+                return self._fallback_local(request, degraded=True)
+            self._set_hub(rediscovered)
+
+        try:
+            forwarded, taxonomy_wing, resp = self._dispatch_to_hub(
+                request, tool_name, query_target, underlying, parsed
+            )
+        except FORWARD_ERRORS as exc:
+            failed_url = self.base_url
+            if isinstance(exc, urllib.error.HTTPError):
+                return proxy_error_response(request, failed_url, exc)
+            self.hub = None
+            self._tool_schemas = None
+            self._wings_cache = None
+            if underlying in READ_ONLY_REFUSED_TOOLS:
+                return proxy_error_response(request, failed_url, exc)
+            restarted = HubClient.discover(self.palace_path) if self.palace_path else None
+            if restarted is not None and restarted.base_url != failed_url:
+                self._set_hub(restarted)
+                try:
+                    forwarded, taxonomy_wing, resp = self._dispatch_to_hub(
+                        request, tool_name, query_target, underlying, parsed
+                    )
+                except FORWARD_ERRORS as retry_exc:
+                    self.hub = None
+                    if isinstance(retry_exc, urllib.error.HTTPError):
+                        return proxy_error_response(request, self.base_url, retry_exc)
+                    logger.warning(
+                        "Hub at %s unreachable (%s); handling request locally",
+                        self.base_url,
+                        retry_exc,
+                    )
+                    return self._fallback_local(request, degraded=True)
+            else:
+                logger.warning(
+                    "Hub at %s unreachable (%s); handling request locally", failed_url, exc
+                )
+                return self._fallback_local(request, degraded=True)
+
+        if underlying == "mempalace_status":
+            from .mcp_proxy import _annotate_forwarded_update_status
+
+            resp = _annotate_forwarded_update_status(forwarded, resp)
+        rewritten = {
+            "params": {"name": underlying},
+            "_taxonomy_wing": taxonomy_wing,
+        }
+        return _postprocess_light_response(rewritten, resp, palace_path=self.palace_path)
+
+
 def dispatch_light_stdio_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Hub-first stdio dispatch: translate palace_* calls, keep the 3-tool handshake local."""
-    method = request.get("method") if isinstance(request, dict) else None
-    if method == "tools/call":
-        rewritten = _rewrite_tools_call_for_hub(request)
+    """Translate palace_* calls and dispatch them through the stdio transport."""
+    return _dispatch_light_request(request, _dispatch_light_stdio_tool)
+
+
+def _dispatch_light_stdio_tool(request):
+    srv = _get_mcp_server()
+    req_id = request.get("id")
+    tool_name = request["params"]["name"]
+    # The destination owns the lease. Check local restrictions before forwarding
+    # without competing for the hub's writer lock.
+    refusal = srv._mcp_tool_preflight_refusal(req_id, tool_name, check_writer=False)
+    if refusal is not None:
+        return refusal
+    try:
+        return srv._dispatch_stdio_request(request)
+    except Exception as exc:
+        return srv._internal_tool_error(
+            req_id, tool_name, exc, include_message=isinstance(exc, ValueError)
+        )
+
+
+def _dispatch_light_request(request, dispatch, *, read_lock=nullcontext):
+    """Translate the light catalog to core tools before dispatching through a transport."""
+    if (
+        isinstance(request, dict)
+        and request.get("jsonrpc") == "2.0"
+        and request.get("method") == "tools/call"
+    ):
+        rewritten = _rewrite_tools_call_for_hub(request, read_lock=read_lock)
+        if isinstance(rewritten, dict) and rewritten.get("_unknown_target"):
+            return _unknown_target_error(request.get("id"))
         if isinstance(rewritten, dict) and rewritten.get("_parse_error"):
             req_id = request.get("id")
             payload = {"success": False, "error": f"PQL parse error: {rewritten['message']}"}
@@ -987,24 +1464,44 @@ def dispatch_light_stdio_request(request: Dict[str, Any]) -> Optional[Dict[str, 
             }
         if rewritten is not None:
             forwarded = {k: v for k, v in rewritten.items() if not k.startswith("_")}
-            underlying = ((forwarded.get("params") or {}).get("name")) or ""
-            # The destination owns the lease: hub forwarding must not first
-            # compete for the hub's local writer lock. Local dispatch still
-            # runs the full gate inside handle_request, as does the hub.
-            refusal = mcp_server._mcp_tool_preflight_refusal(
-                request.get("id"), underlying, check_writer=False
-            )
-            if refusal is not None:
-                return refusal
-            try:
-                resp = mcp_server._dispatch_stdio_request(forwarded)
-            except Exception as exc:
-                return mcp_server._internal_tool_error(request.get("id"), underlying, exc)
-            return _postprocess_light_response(rewritten, resp)
+            return _postprocess_light_response(rewritten, dispatch(forwarded), read_lock=read_lock)
     return handle_light_request(request)
 
 
+def _run_light_hub_proxy(hub: HubClient, palace_path: str) -> None:
+    proxy = _LightHubProxy(hub, palace_path)
+    logger.info(
+        "MemPalace Lightweight MCP Server proxying to hub %s (3 consolidated tools)...",
+        hub.base_url,
+    )
+    while True:
+        try:
+            line = sys.stdin.readline()
+        except KeyboardInterrupt:
+            break
+        except OSError as exc:
+            logger.info("stdin read failed (%s) -- client disconnected, shutting down", exc)
+            break
+        if not line:
+            logger.info("stdin EOF -- client disconnected, shutting down")
+            break
+        line = line.strip()
+        if not line:
+            continue
+        payload = _stdio_reply_light(line, proxy.handle)
+        if payload is None:
+            continue
+        try:
+            sys.stdout.write(payload + "\n")
+            sys.stdout.flush()
+        except (BrokenPipeError, OSError):
+            break
+
+
 def main():
+    # A long-lived, mostly idle server: cap BLAS/OpenMP pools before a local
+    # fallback can import mcp_server (and with it numpy).
+    cap_server_blas_threads()
     parser = argparse.ArgumentParser(description="MemPalace Lightweight MCP Server")
     parser.add_argument("--palace", help="Path to palace directory")
     parser.add_argument("--collection", help="Chroma collection name")
@@ -1015,19 +1512,6 @@ def main():
     parser.add_argument("--read-only", action="store_true", help="Run in read-only mode")
     args = parser.parse_args()
 
-    if args.palace:
-        mcp_server._config.palace_path = args.palace
-        os.environ["MEMPALACE_PALACE_PATH"] = os.path.abspath(args.palace)
-    if args.collection:
-        mcp_server._config.collection_name = args.collection
-    if args.backend:
-        backend_name = str(args.backend).strip().lower()
-        os.environ["MEMPALACE_BACKEND_EXPLICIT"] = backend_name
-        os.environ["MEMPALACE_BACKEND"] = backend_name
-    if args.read_only:
-        mcp_server._READ_ONLY = True
-
-    # Run stdio protocol loop with lightweight dispatcher
     _restore_stdout()
     for stream in (sys.stdin, sys.stdout):
         if hasattr(stream, "reconfigure"):
@@ -1035,10 +1519,22 @@ def main():
                 stream.reconfigure(encoding="utf-8", errors="replace")
             except (AttributeError, OSError):
                 pass
+
+    hub = _hub_for_light_session(args)
+    if hub is not None:
+        _run_light_hub_proxy(hub, hub.palace_path)
+        return
+
+    srv = _get_mcp_server()
+    srv._apply_server_flags(palace=args.palace, backend=args.backend, read_only=args.read_only)
+    if args.collection:
+        srv._config.collection_name = args.collection
+
+    # Run stdio protocol loop with lightweight dispatcher
     logger.info("MemPalace Lightweight MCP Server starting (3 consolidated tools)...")
-    mcp_server._maybe_eager_warmup_embedder()
-    mcp_server._start_idle_exit_watchdog()
-    mcp_server._start_write_stall_watchdog()
+    srv._maybe_eager_warmup_embedder()
+    srv._start_idle_exit_watchdog()
+    srv._start_write_stall_watchdog()
 
     while True:
         try:
@@ -1054,21 +1550,14 @@ def main():
         line = line.strip()
         if not line:
             continue
-        try:
-            req = json.loads(line)
-        except json.JSONDecodeError:
+        payload = srv._stdio_reply(line, dispatch_light_stdio_request)
+        if payload is None:
             continue
         try:
-            resp = dispatch_light_stdio_request(req)
-        except Exception as exc:
-            logger.error("Server error: %s", exc)
-            continue
-        if resp is not None:
-            try:
-                sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
-                sys.stdout.flush()
-            except (BrokenPipeError, OSError):
-                break
+            sys.stdout.write(payload + "\n")
+            sys.stdout.flush()
+        except (BrokenPipeError, OSError):
+            break
 
 
 if __name__ == "__main__":

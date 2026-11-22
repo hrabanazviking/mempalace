@@ -9,13 +9,14 @@ caller's terminal.
 from __future__ import annotations
 
 import contextlib
-import io
 import functools
+import io
 import os
 import sys
 from typing import Any
 
 from .config import MempalaceConfig
+from .tool_capabilities import classify_tool
 
 _EXPLICIT_BACKEND_ENV = "MEMPALACE_BACKEND_EXPLICIT"
 _PALACE_PATH_ENV = "MEMPALACE_PALACE_PATH"
@@ -55,62 +56,6 @@ _BACKEND_ENV = "MEMPALACE_BACKEND"
 # (e.g. qdrant) cannot poison every later job in the same daemon process —
 # including mcp_tool jobs, which read MempalaceConfig (and thus the leaked env).
 _PER_JOB_ENV = (_PALACE_PATH_ENV, _BACKEND_ENV, _EXPLICIT_BACKEND_ENV)
-
-
-READ_TOOLS = frozenset(
-    {
-        "mempalace_status",
-        "mempalace_list_wings",
-        "mempalace_list_rooms",
-        "mempalace_get_taxonomy",
-        "mempalace_get_aaak_spec",
-        "mempalace_traverse",
-        "mempalace_find_tunnels",
-        "mempalace_graph_stats",
-        "mempalace_list_tunnels",
-        "mempalace_list_hallways",
-        "mempalace_follow_tunnels",
-        "mempalace_search",
-        "mempalace_check_duplicate",
-        "mempalace_get_drawer",
-        "mempalace_list_drawers",
-        "mempalace_diary_read",
-        "mempalace_kg_query",
-        "mempalace_kg_stats",
-        "mempalace_kg_timeline",
-    }
-)
-
-WRITE_TOOLS = frozenset(
-    {
-        "mempalace_add_drawer",
-        "mempalace_checkpoint",
-        "mempalace_delete_by_source",
-        "mempalace_delete_drawer",
-        "mempalace_update_drawer",
-        "mempalace_diary_write",
-        "mempalace_kg_add",
-        "mempalace_kg_invalidate",
-        "mempalace_create_tunnel",
-        "mempalace_delete_tunnel",
-        "mempalace_delete_hallway",
-        "mempalace_hook_settings",
-        "mempalace_memories_filed_away",
-    }
-)
-
-MAINTENANCE_TOOLS = frozenset({"mempalace_mine", "mempalace_sync", "mempalace_reconnect"})
-
-
-def classify_tool(name: str) -> str:
-    """Return ``read``, ``write``, ``maintenance``, or ``unknown`` for an MCP tool."""
-    if name in READ_TOOLS:
-        return "read"
-    if name in WRITE_TOOLS:
-        return "write"
-    if name in MAINTENANCE_TOOLS:
-        return "maintenance"
-    return "unknown"
 
 
 def _apply_backend(backend: str | None) -> None:
@@ -263,7 +208,7 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
         _run_pass_zero(project_dir=source, palace_dir=palace_path, llm_provider=None)
 
     from .daemon import LOCK_REFUSAL_ERROR_CLASS
-    from .palace import MineAlreadyRunning, MineValidationError
+    from .palace import MineAlreadyRunning, MineFileErrors, MineValidationError
 
     try:
         if source_adapter:
@@ -274,6 +219,9 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
                 source_path=source,
                 palace_path=palace_path,
                 dry_run=dry_run,
+                project=wing,
+                related_drawer_id=payload.get("related_drawer_id"),
+                explicit_palace=bool(payload.get("explicit_palace")),
             )
         elif mode == "convos":
             from .convo_miner import mine_convos
@@ -286,6 +234,7 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
                 limit=limit,
                 dry_run=dry_run,
                 extract_mode=payload.get("extract") or "exchange",
+                include_subagents=bool(payload.get("include_subagents")),
             )
         elif mode == "extract":
             from .format_miner import mine_formats
@@ -321,6 +270,14 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
             "success": False,
             "error": str(exc),
             "error_class": LOCK_REFUSAL_ERROR_CLASS,
+            "exit_code": 1,
+        }
+    except MineFileErrors as exc:
+        return {
+            "success": False,
+            "error": str(exc),
+            "error_class": "MineFileErrors",
+            "files_failed": len(exc.failed_files),
             "exit_code": 1,
         }
     except MineValidationError as exc:
@@ -522,6 +479,10 @@ def run_sync(payload: dict[str, Any]) -> dict[str, Any]:
     print(f"  Unresolved:     {report['unresolved']}  (kept)")
     print(f"  No source:      {report['no_source']}  (kept)")
     print(f"  Out of scope:   {report['out_of_scope']}  (kept)")
+    if report.get("preserved"):
+        print(
+            f"  Preserved:      {report['preserved']}  (kept: conversation, diary or manual memory)"
+        )
 
     by_source = report.get("by_source") or {}
     if by_source:
@@ -573,16 +534,47 @@ def run_diary_write(payload: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+_MCP_USAGE_ERROR_CODES = frozenset({-32600, -32601, -32602, -32700})
+
+
+def _daemon_result_from_mcp_refusal(error: dict[str, Any]) -> dict[str, Any]:
+    """Turn a refused or failed tools/call into a failed daemon job result.
+
+    A peer writer holding the palace is the same deferral as the write lock
+    held by another process, so it carries that ``error_class`` and the worker
+    retries it later instead of dead-lettering the write.
+    """
+    code = error.get("code")
+    data = error.get("data") if isinstance(error.get("data"), dict) else {}
+    out: dict[str, Any] = {
+        "success": False,
+        "error": str(data.get("message") or error.get("message") or "MCP tool call failed"),
+        "exit_code": 2 if code in _MCP_USAGE_ERROR_CODES else 1,
+        "jsonrpc_code": code,
+    }
+    for key in ("tool", "error_class"):
+        if data.get(key):
+            out[key] = data[key]
+    if data.get("failure_kind") == "peer_contention":
+        from .daemon import LOCK_REFUSAL_ERROR_CLASS
+
+        out["error_class"] = LOCK_REFUSAL_ERROR_CLASS
+    return out
+
+
+@_restores_palace_env
 def run_mcp_tool(payload: dict[str, Any]) -> dict[str, Any]:
     """Execute an MCP tool by name over the daemon queue.
 
     The daemon is a durable, retried write surface — not a general MCP transport.
     Restrict ``mcp_tool`` to write-classified tools only: read tools would
-    exfiltrate verbatim palace content into the queue DB and the job result
-    (stored world-readable-by-default without the perms fix, and returned over
-    /jobs), and maintenance tools already have their own dedicated kinds
-    (mine/sync). No internal caller currently uses ``mcp_tool``; this allowlist
-    bounds the blast radius of the generic escape hatch.
+    exfiltrate verbatim palace content into the queue DB and the job result,
+    and maintenance tools already have their own dedicated kinds (mine/sync).
+
+    Dispatch goes through ``mcp_server.call_tool``, the tools/call path of
+    ``handle_request``, so the read-only, sqlite-integrity, stale-library,
+    diverged-index, and peer-writer gates run, and argument filtering and type
+    coercion match a real tools/call.
     """
     name = payload.get("name")
     arguments = payload.get("arguments") or {}
@@ -595,11 +587,22 @@ def run_mcp_tool(payload: dict[str, Any]) -> dict[str, Any]:
             "error": f"daemon mcp_tool only accepts write tools; {name!r} is {classification}",
             "exit_code": 2,
         }
-    from .mcp_server import TOOLS
+    from . import mcp_server
 
-    if name not in TOOLS:
+    # A daemon serves the one palace it was started for. Point the server at it
+    # as --palace would, which is also what puts knowledge-graph writes beside
+    # that palace rather than in the per-user default graph. The decorator
+    # restores the environment variable; the server's --palace flag stays raised
+    # for the daemon's lifetime, as it would for a server started with --palace.
+    mcp_server._apply_server_flags(palace=payload.get("palace_path"))
+
+    if name not in mcp_server.TOOLS:
         return {"success": False, "error": f"unknown MCP tool: {name}", "exit_code": 2}
-    result = TOOLS[name]["handler"](**arguments)
+    refusal, result = mcp_server.call_tool(
+        "daemon-mcp-tool", {"name": name, "arguments": arguments}, internal=True
+    )
+    if refusal is not None:
+        return _daemon_result_from_mcp_refusal(refusal["error"])
     if isinstance(result, dict):
         # Several write tools signal failure with a bare {"error": ...} and no
         # explicit success flag (e.g. tool_create_tunnel / tool_delete_tunnel
